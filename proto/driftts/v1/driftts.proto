@@ -1,0 +1,111 @@
+syntax = "proto3";
+
+package driftts.v1;
+
+enum SeriesType {
+  SERIES_TYPE_UNSPECIFIED = 0;
+  SERIES_TYPE_F64 = 1;
+  SERIES_TYPE_I64 = 2;
+  SERIES_TYPE_BOOL = 3;
+}
+
+message Sample {
+  uint64 data_id = 1;
+  int64 timestamp_ms = 2;
+
+  oneof value {
+    double f64_value = 3;
+    sint64 i64_value = 4;
+    bool bool_value = 5;
+  }
+}
+
+message RangeSample {
+  int64 timestamp_ms = 1;
+
+  oneof value {
+    double f64_value = 2;
+    sint64 i64_value = 3;
+    bool bool_value = 4;
+  }
+}
+
+message RegisterSeriesRequest {
+  uint64 data_id = 1;
+  SeriesType series_type = 2;
+}
+
+message RegisterSeriesResponse {}
+
+message AppendBatchRequest {
+  repeated Sample samples = 1;
+}
+
+message AppendError {
+  uint32 index = 1;
+  string reason = 2;
+}
+
+message AppendBatchResponse {
+  uint32 accepted = 1;
+  uint32 rejected = 2;
+  repeated AppendError errors = 3;
+}
+
+message FlushSeriesRequest {
+  uint64 data_id = 1;
+}
+
+message FlushSeriesResponse {
+  bool flushed = 1;
+}
+
+message FlushAllRequest {}
+
+message FlushAllResponse {
+  uint32 flushed_series = 1;
+}
+
+message RangeQueryRequest {
+  uint64 data_id = 1;
+  int64 start_ts_ms = 2;
+  int64 end_ts_ms = 3;
+  optional uint32 limit = 4;
+}
+
+message RangeQueryResponse {
+  repeated RangeSample samples = 1;
+}
+
+message StatsRequest {}
+
+message StatsResponse {
+  uint64 storage_bytes = 1;
+  uint64 max_storage_bytes = 2;
+  uint64 series_count = 3;
+  uint64 segment_count = 4;
+  uint64 buffered_samples = 5;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
+service IngestService {
+  rpc RegisterSeries(RegisterSeriesRequest) returns (RegisterSeriesResponse);
+  rpc AppendBatch(AppendBatchRequest) returns (AppendBatchResponse);
+  rpc FlushSeries(FlushSeriesRequest) returns (FlushSeriesResponse);
+  rpc FlushAll(FlushAllRequest) returns (FlushAllResponse);
+}
+
+service QueryService {
+  rpc RangeQuery(RangeQueryRequest) returns (RangeQueryResponse);
+}
+
+service AdminService {
+  rpc Stats(StatsRequest) returns (StatsResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
