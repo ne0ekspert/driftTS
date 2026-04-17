@@ -19,6 +19,7 @@ const HEADER_SIZE: usize = 48;
 const COMPRESSED_CODEC_OFFSET: usize = 6;
 const UNCOMPRESSED_SIZE_OFFSET: usize = 17;
 pub const DEFAULT_SEGMENT_CACHE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SEGMENT_BODY_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -510,11 +511,38 @@ fn encode_payload(compression: SegmentCompressionCodec, body: &[u8]) -> Result<V
 }
 
 fn decode_payload(path: &Path, header: &SegmentHeader, payload: &[u8]) -> Result<Vec<u8>> {
+    if header.uncompressed_size_bytes > MAX_SEGMENT_BODY_BYTES {
+        return Err(TsdbError::CorruptSegment(format!(
+            "segment body for {} exceeds limit: {} > {}",
+            path.display(),
+            header.uncompressed_size_bytes,
+            MAX_SEGMENT_BODY_BYTES
+        )));
+    }
+
     let body = match header.compression {
         SegmentCompressionCodec::None => payload.to_vec(),
-        SegmentCompressionCodec::Zstd => zstd::stream::decode_all(payload).map_err(|error| {
-            TsdbError::CorruptSegment(format!("failed to decompress {}: {error}", path.display()))
-        })?,
+        SegmentCompressionCodec::Zstd => {
+            let decoder = zstd::stream::read::Decoder::new(payload).map_err(|error| {
+                TsdbError::CorruptSegment(format!(
+                    "failed to initialize decompressor for {}: {error}",
+                    path.display()
+                ))
+            })?;
+            let mut limited = decoder.take(header.uncompressed_size_bytes + 1);
+            let mut body = Vec::new();
+            limited.read_to_end(&mut body).map_err(|error| {
+                TsdbError::CorruptSegment(format!("failed to decompress {}: {error}", path.display()))
+            })?;
+            if body.len() as u64 > header.uncompressed_size_bytes {
+                return Err(TsdbError::CorruptSegment(format!(
+                    "decompressed body for {} exceeds declared size {}",
+                    path.display(),
+                    header.uncompressed_size_bytes
+                )));
+            }
+            body
+        }
     };
 
     if body.len() as u64 != header.uncompressed_size_bytes {
@@ -823,6 +851,46 @@ mod tests {
         fs::write(&path, bytes).unwrap();
 
         let error = read_segment_file(&path).unwrap_err();
+        assert!(matches!(error, TsdbError::CorruptSegment(_)));
+    }
+
+    #[test]
+    fn rejects_segment_bodies_above_decode_limit() {
+        let path = Path::new("oversized.seg");
+        let header = SegmentHeader {
+            version: SEGMENT_VERSION_CURRENT,
+            compression: SegmentCompressionCodec::Zstd,
+            data_id: 1,
+            series_type: SeriesType::I64,
+            min_ts_ms: 0,
+            max_ts_ms: 0,
+            count: ((MAX_SEGMENT_BODY_BYTES / record_size(SeriesType::I64) as u64) + 1) as u32,
+            uncompressed_size_bytes: MAX_SEGMENT_BODY_BYTES + 16,
+            crc32: 0,
+        };
+
+        let error = decode_payload(path, &header, &[]).unwrap_err();
+        assert!(matches!(error, TsdbError::CorruptSegment(_)));
+    }
+
+    #[test]
+    fn rejects_zstd_payloads_that_expand_past_declared_size() {
+        let path = Path::new("bomb.seg");
+        let body = vec![0_u8; record_size(SeriesType::I64) * 2];
+        let payload = zstd::stream::encode_all(body.as_slice(), 0).unwrap();
+        let header = SegmentHeader {
+            version: SEGMENT_VERSION_CURRENT,
+            compression: SegmentCompressionCodec::Zstd,
+            data_id: 1,
+            series_type: SeriesType::I64,
+            min_ts_ms: 0,
+            max_ts_ms: 1,
+            count: 1,
+            uncompressed_size_bytes: record_size(SeriesType::I64) as u64,
+            crc32: 0,
+        };
+
+        let error = decode_payload(path, &header, &payload).unwrap_err();
         assert!(matches!(error, TsdbError::CorruptSegment(_)));
     }
 
