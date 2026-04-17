@@ -1,4 +1,10 @@
-listen_addr = "127.0.0.1:50051"
+# TCP listener:
+listen_addr = "127.0.0.1"
+listen_port = 50051
+
+# Unix socket listener:
+# listen_addr = "/tmp/drift-ts.sock"
+
 data_dir = "data"
 flush_threshold_count = 1000
 max_storage_bytes = 104857600

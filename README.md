@@ -46,11 +46,20 @@ cargo build
 Use the sample config in [`drift-ts.toml`](/home/ne0ekspert/drifTS/drift-ts.toml):
 
 ```toml
-listen_addr = "127.0.0.1:50051"
+# TCP listener:
+listen_addr = "127.0.0.1"
+listen_port = 50051
 data_dir = "data"
 flush_threshold_count = 1000
 max_storage_bytes = 104857600
 segment_compression = "zstd"
+```
+
+`listen_addr` can also be a Unix domain socket path on Unix systems, for example:
+
+```toml
+# Unix socket listener:
+listen_addr = "/tmp/drift-ts.sock"
 ```
 
 Run the server:
@@ -71,7 +80,8 @@ The server accepts exactly one CLI flag:
 
 Config fields:
 
-- `listen_addr`: socket address for the gRPC server, for example `127.0.0.1:50051`
+- `listen_addr`: TCP host/IP such as `127.0.0.1` or `localhost`, or a Unix socket path such as `/tmp/drift-ts.sock`
+- `listen_port`: optional TCP port. When set, the server binds TCP using `listen_addr` + `listen_port`. When omitted, `listen_addr` is treated as a Unix socket path
 - `data_dir`: root directory for `manifest.json` and segment files
 - `flush_threshold_count`: number of buffered samples per series before an automatic flush
 - `max_storage_bytes`: soft storage ceiling for flushed segments
@@ -80,6 +90,8 @@ Config fields:
 Validation rules:
 
 - `listen_addr` must be non-empty
+- when `listen_port` is set, `listen_addr` must be a TCP host/IP, not a path
+- when `listen_port` is omitted, `listen_addr` must be a Unix socket path
 - `flush_threshold_count` must be greater than zero
 - `max_storage_bytes` must be greater than zero
 

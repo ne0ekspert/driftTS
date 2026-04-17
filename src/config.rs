@@ -9,9 +9,16 @@ use crate::error::{Result, TsdbError};
 
 pub const DEFAULT_CONFIG_PATH: &str = "drift-ts.toml";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListenEndpoint {
+    Tcp { host: String, port: u16 },
+    Unix(PathBuf),
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub listen_addr: String,
+    pub listen_port: Option<u16>,
     pub data_dir: PathBuf,
     pub flush_threshold_count: usize,
     pub max_storage_bytes: u64,
@@ -77,10 +84,39 @@ impl AppConfig {
         }
         Ok(())
     }
+
+    pub fn listen_endpoint(&self) -> Result<ListenEndpoint> {
+        let value = self.listen_addr.trim();
+
+        if let Some(port) = self.listen_port {
+            if looks_like_unix_socket_path(value) {
+                return Err(TsdbError::Config(format!(
+                    "listen_addr must be a TCP host or IP address when listen_port is set, got path-like value: {value}"
+                )));
+            }
+
+            return Ok(ListenEndpoint::Tcp {
+                host: value.to_string(),
+                port,
+            });
+        }
+
+        if looks_like_unix_socket_path(value) {
+            return Ok(ListenEndpoint::Unix(PathBuf::from(value)));
+        }
+
+        Err(TsdbError::Config(format!(
+            "listen_addr must be a Unix socket path when listen_port is omitted, or a TCP host/IP when listen_port is set, got: {value}"
+        )))
+    }
 }
 
 fn default_segment_compression() -> SegmentCompressionCodec {
     SegmentCompressionCodec::default()
+}
+
+fn looks_like_unix_socket_path(value: &str) -> bool {
+    value.contains(std::path::MAIN_SEPARATOR) || value.starts_with('.') || value.ends_with(".sock")
 }
 
 #[cfg(test)]
@@ -101,7 +137,8 @@ mod tests {
         let path = write_config(
             &tempdir,
             r#"
-listen_addr = "127.0.0.1:50051"
+listen_addr = "127.0.0.1"
+listen_port = 50051
 data_dir = "data"
 flush_threshold_count = 1000
 max_storage_bytes = 104857600
@@ -118,7 +155,8 @@ max_storage_bytes = 104857600
         let path = write_config(
             &tempdir,
             r#"
-listen_addr = "127.0.0.1:50051"
+listen_addr = "127.0.0.1"
+listen_port = 50051
 data_dir = "data"
 flush_threshold_count = 1000
 max_storage_bytes = 104857600
@@ -128,5 +166,137 @@ segment_compression = "none"
 
         let config = AppConfig::load_from_path(path).unwrap();
         assert_eq!(config.segment_compression, SegmentCompressionCodec::None);
+    }
+
+    #[test]
+    fn parses_tcp_listen_endpoint() {
+        let tempdir = TempDir::new().unwrap();
+        let path = write_config(
+            &tempdir,
+            r#"
+listen_addr = "127.0.0.1"
+listen_port = 50051
+data_dir = "data"
+flush_threshold_count = 1000
+max_storage_bytes = 104857600
+"#,
+        );
+
+        let config = AppConfig::load_from_path(path).unwrap();
+        assert_eq!(
+            config.listen_endpoint().unwrap(),
+            ListenEndpoint::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: 50051
+            }
+        );
+    }
+
+    #[test]
+    fn parses_hostname_tcp_listen_endpoint() {
+        let tempdir = TempDir::new().unwrap();
+        let path = write_config(
+            &tempdir,
+            r#"
+listen_addr = "localhost"
+listen_port = 50051
+data_dir = "data"
+flush_threshold_count = 1000
+max_storage_bytes = 104857600
+"#,
+        );
+
+        let config = AppConfig::load_from_path(path).unwrap();
+        assert_eq!(
+            config.listen_endpoint().unwrap(),
+            ListenEndpoint::Tcp {
+                host: "localhost".to_string(),
+                port: 50051
+            }
+        );
+    }
+
+    #[test]
+    fn parses_unix_socket_listen_endpoint() {
+        let tempdir = TempDir::new().unwrap();
+        let path = write_config(
+            &tempdir,
+            r#"
+listen_addr = "./run/drift-ts.sock"
+data_dir = "data"
+flush_threshold_count = 1000
+max_storage_bytes = 104857600
+"#,
+        );
+
+        let config = AppConfig::load_from_path(path).unwrap();
+        assert_eq!(
+            config.listen_endpoint().unwrap(),
+            ListenEndpoint::Unix(PathBuf::from("./run/drift-ts.sock"))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_listen_endpoint() {
+        let tempdir = TempDir::new().unwrap();
+        let path = write_config(
+            &tempdir,
+            r#"
+listen_addr = "localhost"
+data_dir = "data"
+flush_threshold_count = 1000
+max_storage_bytes = 104857600
+"#,
+        );
+
+        let config = AppConfig::load_from_path(path).unwrap();
+        let err = config.listen_endpoint().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("listen_addr must be a Unix socket path when listen_port is omitted")
+        );
+    }
+
+    #[test]
+    fn rejects_socket_addr_syntax_without_listen_port() {
+        let tempdir = TempDir::new().unwrap();
+        let path = write_config(
+            &tempdir,
+            r#"
+listen_addr = "127.0.0.1:50051"
+data_dir = "data"
+flush_threshold_count = 1000
+max_storage_bytes = 104857600
+"#,
+        );
+
+        let config = AppConfig::load_from_path(path).unwrap();
+        let err = config.listen_endpoint().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("listen_addr must be a Unix socket path when listen_port is omitted")
+        );
+    }
+
+    #[test]
+    fn rejects_path_like_tcp_host_when_port_is_set() {
+        let tempdir = TempDir::new().unwrap();
+        let path = write_config(
+            &tempdir,
+            r#"
+listen_addr = "/tmp/drift-ts.sock"
+listen_port = 50051
+data_dir = "data"
+flush_threshold_count = 1000
+max_storage_bytes = 104857600
+"#,
+        );
+
+        let config = AppConfig::load_from_path(path).unwrap();
+        let err = config.listen_endpoint().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("listen_addr must be a TCP host or IP address when listen_port is set")
+        );
     }
 }

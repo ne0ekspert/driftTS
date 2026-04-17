@@ -127,6 +127,7 @@ name = "drift-ts"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
+ "hyper-util",
  "prost",
  "protoc-bin-vendored",
  "serde",
@@ -134,10 +135,12 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "toml",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tower",
  "zstd",
 ]
 
