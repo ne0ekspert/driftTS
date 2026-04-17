@@ -7,13 +7,11 @@ use serde::{Deserialize, Serialize};
 use crate::core::types::{DataId, SeriesType};
 use crate::error::{Result, TsdbError};
 
-pub const MANIFEST_VERSION: u32 = 1;
+pub const MANIFEST_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: u32,
-    pub storage_bytes: u64,
-    pub max_storage_bytes: u64,
     pub series: HashMap<DataId, SeriesEntry>,
 }
 
@@ -21,6 +19,10 @@ pub struct Manifest {
 pub struct SeriesEntry {
     pub series_type: SeriesType,
     pub next_segment_id: u64,
+    #[serde(default)]
+    pub max_storage_bytes: Option<u64>,
+    #[serde(default)]
+    pub storage_bytes: u64,
     pub segments: Vec<SegmentMeta>,
 }
 
@@ -35,24 +37,21 @@ pub struct SegmentMeta {
 }
 
 impl Manifest {
-    pub fn new(max_storage_bytes: u64) -> Self {
+    pub fn new() -> Self {
         Self {
             version: MANIFEST_VERSION,
-            storage_bytes: 0,
-            max_storage_bytes,
             series: HashMap::new(),
         }
     }
 
-    pub fn load(data_dir: &Path, max_storage_bytes: u64) -> Result<Self> {
+    pub fn load(data_dir: &Path) -> Result<Self> {
         let path = manifest_path(data_dir);
         if !path.exists() {
-            return Ok(Self::new(max_storage_bytes));
+            return Ok(Self::new());
         }
 
         let raw = fs::read_to_string(&path)?;
         let mut manifest: Manifest = serde_json::from_str(&raw)?;
-        manifest.max_storage_bytes = max_storage_bytes;
         manifest.version = MANIFEST_VERSION;
         Ok(manifest)
     }
@@ -70,12 +69,17 @@ impl Manifest {
     }
 
     pub fn recompute_storage_bytes(&mut self) {
-        self.storage_bytes = self
-            .series
-            .values()
-            .flat_map(|entry| entry.segments.iter())
-            .map(|segment| segment.size_bytes)
-            .sum();
+        for entry in self.series.values_mut() {
+            entry.storage_bytes = entry
+                .segments
+                .iter()
+                .map(|segment| segment.size_bytes)
+                .sum();
+        }
+    }
+
+    pub fn total_storage_bytes(&self) -> u64 {
+        self.series.values().map(|entry| entry.storage_bytes).sum()
     }
 
     pub fn total_segment_count(&self) -> usize {

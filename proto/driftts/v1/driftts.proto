@@ -33,6 +33,7 @@ message RangeSample {
 message RegisterSeriesRequest {
   uint64 data_id = 1;
   SeriesType series_type = 2;
+  optional uint64 max_storage_bytes = 3;
 }
 
 message RegisterSeriesResponse {}
@@ -81,7 +82,6 @@ message StatsRequest {}
 
 message StatsResponse {
   uint64 storage_bytes = 1;
-  uint64 max_storage_bytes = 2;
   uint64 series_count = 3;
   uint64 segment_count = 4;
   uint64 buffered_samples = 5;

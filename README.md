@@ -16,8 +16,8 @@ The crate ships as both:
 - Manifest-backed recovery on startup
 - CRC32-protected segment files
 - Optional `none|zstd` compression for flushed segment files
-- Configurable flush threshold and storage cap
-- Automatic oldest-segment eviction when the storage budget is exceeded
+- Configurable flush threshold and per-series retention cap
+- Automatic oldest-segment eviction when a series exceeds its retention budget
 - gRPC services generated from [`proto/driftts/v1/driftts.proto`](/home/ne0ekspert/drifTS/proto/driftts/v1/driftts.proto)
 
 ## Project Layout
@@ -51,7 +51,7 @@ listen_addr = "127.0.0.1"
 listen_port = 50051
 data_dir = "data"
 flush_threshold_count = 1000
-max_storage_bytes = 104857600
+default_series_max_bytes = 104857600
 segment_compression = "zstd"
 ```
 
@@ -84,7 +84,7 @@ Config fields:
 - `listen_port`: optional TCP port. When set, the server binds TCP using `listen_addr` + `listen_port`. When omitted, `listen_addr` is treated as a Unix socket path
 - `data_dir`: root directory for `manifest.json` and segment files
 - `flush_threshold_count`: number of buffered samples per series before an automatic flush
-- `max_storage_bytes`: soft storage ceiling for flushed segments
+- `default_series_max_bytes`: optional flushed-segment retention ceiling applied to newly registered series when they do not provide an explicit limit
 - `segment_compression`: codec for newly written segment files: `none` or `zstd` (defaults to `zstd` if omitted)
 
 Validation rules:
@@ -93,7 +93,7 @@ Validation rules:
 - when `listen_port` is set, `listen_addr` must be a TCP host/IP, not a path
 - when `listen_port` is omitted, `listen_addr` must be a Unix socket path
 - `flush_threshold_count` must be greater than zero
-- `max_storage_bytes` must be greater than zero
+- `default_series_max_bytes` must be greater than zero when set
 
 ## gRPC API
 
@@ -107,7 +107,7 @@ Services:
 
 RPCs:
 
-- `RegisterSeries(data_id, series_type)`
+- `RegisterSeries(data_id, series_type, max_storage_bytes?)`
 - `AppendBatch(samples[])`
 - `FlushSeries(data_id)`
 - `FlushAll()`
@@ -124,7 +124,7 @@ grpcurl \
   -plaintext \
   -import-path proto \
   -proto proto/driftts/v1/driftts.proto \
-  -d '{"data_id":42,"series_type":"SERIES_TYPE_I64"}' \
+  -d '{"data_id":42,"series_type":"SERIES_TYPE_I64","max_storage_bytes":104857600}' \
   127.0.0.1:50051 \
   driftts.v1.IngestService/RegisterSeries
 ```
@@ -199,8 +199,10 @@ Startup recovery:
 - Samples older than or equal to the latest flushed timestamp for a series are rejected.
 - Duplicate timestamps inside the in-memory buffer are deduplicated on flush; the last write wins.
 - Query results merge flushed data with buffered data and also keep the last value for duplicate timestamps.
-- `max_storage_bytes` applies to flushed segments only. When exceeded, the engine deletes the globally oldest segment until usage is back under the limit.
+- Per-series `max_storage_bytes` applies to flushed segments only. When exceeded, the engine deletes the oldest flushed segment in that series until usage is back under the limit.
+- `default_series_max_bytes` is copied into a series when it is registered without an explicit limit, including older manifests upgraded during recovery.
 - `storage_bytes` and eviction use the actual on-disk size of segment files, so compressed segments count by their compressed byte size.
+- The engine does not enforce a node-wide disk ceiling. Total disk usage is the sum of each series' retained flushed segments.
 - Buffered, unflushed samples are not persisted across process restarts.
 - `Health()` currently returns a static `ok=true` / `"ok"` response.
 - There is no authentication, TLS, or compaction layer in the current server.
@@ -236,7 +238,7 @@ Supported flags:
 - `--batch-size N`
 - `--queries N`
 - `--query-span N`
-- `--max-storage-bytes N`
+- `--default-series-max-bytes N`
 - `--segment-compression none|zstd`
 - `--data-dir PATH`
 

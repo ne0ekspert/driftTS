@@ -22,7 +22,7 @@ struct ThroughputConfig {
     queries: u64,
     query_span: i64,
     query_limit: Option<usize>,
-    max_storage_bytes: u64,
+    default_series_max_bytes: Option<u64>,
     segment_compression: SegmentCompressionCodec,
     data_dir: Option<PathBuf>,
     ingest_mode: IngestMode,
@@ -38,7 +38,7 @@ impl Default for ThroughputConfig {
             queries: 2_000,
             query_span: 2_048,
             query_limit: None,
-            max_storage_bytes: 1 << 30,
+            default_series_max_bytes: Some(1 << 27),
             segment_compression: SegmentCompressionCodec::Zstd,
             data_dir: None,
             ingest_mode: IngestMode::AppendOne,
@@ -64,8 +64,9 @@ impl ThroughputConfig {
                 "--query-limit" => {
                     config.query_limit = Some(parse_usize(args.next(), "--query-limit")?)
                 }
-                "--max-storage-bytes" => {
-                    config.max_storage_bytes = parse_u64(args.next(), "--max-storage-bytes")?
+                "--default-series-max-bytes" => {
+                    config.default_series_max_bytes =
+                        Some(parse_u64(args.next(), "--default-series-max-bytes")?)
                 }
                 "--segment-compression" => {
                     config.segment_compression =
@@ -111,6 +112,9 @@ impl ThroughputConfig {
         if config.query_limit == Some(0) {
             return Err("--query-limit must be greater than zero".to_string());
         }
+        if config.default_series_max_bytes == Some(0) {
+            return Err("--default-series-max-bytes must be greater than zero".to_string());
+        }
 
         Ok(config)
     }
@@ -138,13 +142,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine = Engine::open(EngineConfig {
         data_dir: data_dir.clone(),
         flush_threshold_count: config.flush_threshold,
-        max_storage_bytes: config.max_storage_bytes,
+        default_series_max_bytes: config.default_series_max_bytes,
         segment_compression: config.segment_compression,
     })?;
 
     let register_start = Instant::now();
     for data_id in 0..config.series {
-        engine.register_series(data_id, SeriesType::I64)?;
+        engine.register_series(data_id, SeriesType::I64, None)?;
     }
     let register_elapsed = register_start.elapsed();
 
@@ -278,7 +282,7 @@ fn parse_segment_compression(
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo run --release --bin throughput -- [--ingest-mode append-one|append-batch] [--samples N] [--series N] [--flush-threshold N] [--batch-size N] [--queries N] [--query-span N] [--query-limit N] [--max-storage-bytes N] [--segment-compression none|zstd] [--data-dir PATH]"
+        "usage: cargo run --release --bin throughput -- [--ingest-mode append-one|append-batch] [--samples N] [--series N] [--flush-threshold N] [--batch-size N] [--queries N] [--query-span N] [--query-limit N] [--default-series-max-bytes N] [--segment-compression none|zstd] [--data-dir PATH]"
     );
 }
 

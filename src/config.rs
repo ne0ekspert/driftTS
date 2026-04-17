@@ -21,7 +21,7 @@ pub struct AppConfig {
     pub listen_port: Option<u16>,
     pub data_dir: PathBuf,
     pub flush_threshold_count: usize,
-    pub max_storage_bytes: u64,
+    pub default_series_max_bytes: Option<u64>,
     #[serde(default = "default_segment_compression")]
     pub segment_compression: SegmentCompressionCodec,
 }
@@ -77,9 +77,9 @@ impl AppConfig {
                 "flush_threshold_count must be greater than zero".to_string(),
             ));
         }
-        if self.max_storage_bytes == 0 {
+        if self.default_series_max_bytes == Some(0) {
             return Err(TsdbError::Config(
-                "max_storage_bytes must be greater than zero".to_string(),
+                "default_series_max_bytes must be greater than zero when set".to_string(),
             ));
         }
         Ok(())
@@ -141,7 +141,7 @@ listen_addr = "127.0.0.1"
 listen_port = 50051
 data_dir = "data"
 flush_threshold_count = 1000
-max_storage_bytes = 104857600
+default_series_max_bytes = 104857600
 "#,
         );
 
@@ -159,7 +159,7 @@ listen_addr = "127.0.0.1"
 listen_port = 50051
 data_dir = "data"
 flush_threshold_count = 1000
-max_storage_bytes = 104857600
+default_series_max_bytes = 104857600
 segment_compression = "none"
 "#,
         );
@@ -178,7 +178,7 @@ listen_addr = "127.0.0.1"
 listen_port = 50051
 data_dir = "data"
 flush_threshold_count = 1000
-max_storage_bytes = 104857600
+default_series_max_bytes = 104857600
 "#,
         );
 
@@ -202,7 +202,7 @@ listen_addr = "localhost"
 listen_port = 50051
 data_dir = "data"
 flush_threshold_count = 1000
-max_storage_bytes = 104857600
+default_series_max_bytes = 104857600
 "#,
         );
 
@@ -225,7 +225,7 @@ max_storage_bytes = 104857600
 listen_addr = "./run/drift-ts.sock"
 data_dir = "data"
 flush_threshold_count = 1000
-max_storage_bytes = 104857600
+default_series_max_bytes = 104857600
 "#,
         );
 
@@ -245,7 +245,7 @@ max_storage_bytes = 104857600
 listen_addr = "localhost"
 data_dir = "data"
 flush_threshold_count = 1000
-max_storage_bytes = 104857600
+default_series_max_bytes = 104857600
 "#,
         );
 
@@ -266,7 +266,7 @@ max_storage_bytes = 104857600
 listen_addr = "127.0.0.1:50051"
 data_dir = "data"
 flush_threshold_count = 1000
-max_storage_bytes = 104857600
+default_series_max_bytes = 104857600
 "#,
         );
 
@@ -288,7 +288,7 @@ listen_addr = "/tmp/drift-ts.sock"
 listen_port = 50051
 data_dir = "data"
 flush_threshold_count = 1000
-max_storage_bytes = 104857600
+default_series_max_bytes = 104857600
 "#,
         );
 

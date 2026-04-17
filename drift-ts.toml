@@ -7,5 +7,5 @@ listen_port = 50051
 
 data_dir = "data"
 flush_threshold_count = 1000
-max_storage_bytes = 104857600
+default_series_max_bytes = 104857600
 segment_compression = "zstd"

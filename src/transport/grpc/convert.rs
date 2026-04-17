@@ -79,7 +79,6 @@ pub fn append_response(detail: AppendBatchDetailed) -> pb::AppendBatchResponse {
 pub fn stats_response(stats: EngineStats) -> pb::StatsResponse {
     pb::StatsResponse {
         storage_bytes: stats.storage_bytes,
-        max_storage_bytes: stats.max_storage_bytes,
         series_count: stats.series_count as u64,
         segment_count: stats.segment_count as u64,
         buffered_samples: stats.buffered_samples as u64,

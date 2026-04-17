@@ -27,7 +27,7 @@ async fn grpc_service_round_trip_register_append_query_and_stats() {
     let engine = Engine::open(EngineConfig {
         data_dir: tempdir.path().to_path_buf(),
         flush_threshold_count: 2,
-        max_storage_bytes: 1_000_000,
+        default_series_max_bytes: Some(1_000_000),
         segment_compression: SegmentCompressionCodec::Zstd,
     })
     .unwrap();
@@ -39,6 +39,7 @@ async fn grpc_service_round_trip_register_append_query_and_stats() {
         Request::new(pb::RegisterSeriesRequest {
             data_id: 42,
             series_type: pb::SeriesType::I64 as i32,
+            max_storage_bytes: None,
         }),
     )
     .await
@@ -110,7 +111,7 @@ async fn grpc_server_accepts_unix_domain_socket_connections() {
     let engine = Engine::open(EngineConfig {
         data_dir: tempdir.path().join("data"),
         flush_threshold_count: 2,
-        max_storage_bytes: 1_000_000,
+        default_series_max_bytes: Some(1_000_000),
         segment_compression: SegmentCompressionCodec::Zstd,
     })
     .unwrap();
@@ -159,6 +160,7 @@ async fn grpc_server_accepts_unix_domain_socket_connections() {
         .register_series(pb::RegisterSeriesRequest {
             data_id: 7,
             series_type: pb::SeriesType::I64 as i32,
+            max_storage_bytes: None,
         })
         .await
         .unwrap();

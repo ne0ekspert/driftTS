@@ -19,7 +19,7 @@ use crate::error::{Result, TsdbError};
 pub struct EngineConfig {
     pub data_dir: PathBuf,
     pub flush_threshold_count: usize,
-    pub max_storage_bytes: u64,
+    pub default_series_max_bytes: Option<u64>,
     pub segment_compression: SegmentCompressionCodec,
 }
 
@@ -28,7 +28,7 @@ impl From<&AppConfig> for EngineConfig {
         Self {
             data_dir: value.data_dir.clone(),
             flush_threshold_count: value.flush_threshold_count,
-            max_storage_bytes: value.max_storage_bytes,
+            default_series_max_bytes: value.default_series_max_bytes,
             segment_compression: value.segment_compression,
         }
     }
@@ -50,7 +50,6 @@ pub struct AppendErrorDetail {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineStats {
     pub storage_bytes: u64,
-    pub max_storage_bytes: u64,
     pub series_count: usize,
     pub segment_count: usize,
     pub buffered_samples: usize,
@@ -75,18 +74,24 @@ impl Engine {
         fs::create_dir_all(config.data_dir.join("segments"))?;
         let manifest = recover_manifest(&config)?;
         let series = build_series_state(&manifest);
-
-        Ok(Self {
+        let engine = Self {
             config,
             manifest: Arc::new(Mutex::new(manifest)),
             series: Arc::new(RwLock::new(series)),
             segment_cache: Arc::new(Mutex::new(SegmentReadCache::new(
                 DEFAULT_SEGMENT_CACHE_BYTES,
             ))),
-        })
+        };
+        engine.enforce_all_series_limits()?;
+        Ok(engine)
     }
 
-    pub fn register_series(&self, data_id: DataId, series_type: SeriesType) -> Result<()> {
+    pub fn register_series(
+        &self,
+        data_id: DataId,
+        series_type: SeriesType,
+        max_storage_bytes: Option<u64>,
+    ) -> Result<()> {
         let mut series_map = self.series.write().unwrap();
         if series_map.contains_key(&data_id) {
             return Err(TsdbError::SeriesExists(data_id));
@@ -96,12 +101,20 @@ impl Engine {
         if manifest.series.contains_key(&data_id) {
             return Err(TsdbError::SeriesExists(data_id));
         }
+        let max_storage_bytes = max_storage_bytes.or(self.config.default_series_max_bytes);
+        if max_storage_bytes == Some(0) {
+            return Err(TsdbError::Config(
+                "max_storage_bytes must be greater than zero when set".to_string(),
+            ));
+        }
 
         manifest.series.insert(
             data_id,
             SeriesEntry {
                 series_type,
                 next_segment_id: 1,
+                max_storage_bytes,
+                storage_bytes: 0,
                 segments: Vec::new(),
             },
         );
@@ -280,8 +293,7 @@ impl Engine {
 
     pub fn stats(&self) -> EngineStats {
         let manifest = self.manifest.lock().unwrap();
-        let storage_bytes = manifest.storage_bytes;
-        let max_storage_bytes = manifest.max_storage_bytes;
+        let storage_bytes = manifest.total_storage_bytes();
         let series_count = manifest.series.len();
         let segment_count = manifest.total_segment_count();
         drop(manifest);
@@ -296,7 +308,6 @@ impl Engine {
 
         EngineStats {
             storage_bytes,
-            max_storage_bytes,
             series_count,
             segment_count,
             buffered_samples,
@@ -310,28 +321,29 @@ impl Engine {
         }
     }
 
-    pub fn evict_if_needed(&self) -> Result<()> {
+    pub fn evict_if_needed(&self, data_id: DataId) -> Result<()> {
         loop {
-            let maybe_victim = {
-                let manifest = self.manifest.lock().unwrap();
-                if manifest.storage_bytes <= manifest.max_storage_bytes {
-                    None
-                } else {
-                    manifest
-                        .series
-                        .iter()
-                        .flat_map(|(data_id, entry)| {
-                            entry
-                                .segments
-                                .iter()
-                                .cloned()
-                                .map(move |segment| (*data_id, segment))
-                        })
-                        .min_by_key(|(_, segment)| (segment.max_ts_ms, segment.segment_id))
-                }
-            };
+            let maybe_victim =
+                {
+                    let manifest = self.manifest.lock().unwrap();
+                    match manifest.series.get(&data_id) {
+                        Some(entry) => match entry.max_storage_bytes {
+                            Some(max_storage_bytes) => {
+                                if entry.storage_bytes <= max_storage_bytes {
+                                    None
+                                } else {
+                                    entry.segments.iter().cloned().min_by_key(|segment| {
+                                        (segment.max_ts_ms, segment.segment_id)
+                                    })
+                                }
+                            }
+                            None => None,
+                        },
+                        None => None,
+                    }
+                };
 
-            let Some((data_id, victim)) = maybe_victim else {
+            let Some(victim) = maybe_victim else {
                 break;
             };
 
@@ -355,8 +367,7 @@ impl Engine {
                     .segments
                     .retain(|segment| segment.segment_id != victim.segment_id);
                 if entry.segments.len() != old_len {
-                    manifest.storage_bytes =
-                        manifest.storage_bytes.saturating_sub(victim.size_bytes);
+                    entry.storage_bytes = entry.storage_bytes.saturating_sub(victim.size_bytes);
                 }
             }
             manifest.save(&self.config.data_dir)?;
@@ -420,7 +431,8 @@ impl Engine {
                     .get_mut(&flush.data_id)
                     .ok_or(TsdbError::SeriesNotFound(flush.data_id))?;
                 series_entry.segments.push(meta.clone());
-                manifest.storage_bytes = manifest.storage_bytes.saturating_add(meta.size_bytes);
+                series_entry.storage_bytes =
+                    series_entry.storage_bytes.saturating_add(meta.size_bytes);
             }
             manifest.save(&self.config.data_dir)?;
         }
@@ -435,8 +447,25 @@ impl Engine {
             );
         }
 
-        self.evict_if_needed()?;
+        for flush in &pending {
+            self.evict_if_needed(flush.data_id)?;
+        }
         Ok(pending.len() as u32)
+    }
+
+    fn enforce_all_series_limits(&self) -> Result<()> {
+        let data_ids: Vec<DataId> = self
+            .manifest
+            .lock()
+            .unwrap()
+            .series
+            .keys()
+            .copied()
+            .collect();
+        for data_id in data_ids {
+            self.evict_if_needed(data_id)?;
+        }
+        Ok(())
     }
 
     fn prepare_series_flush(&self, data_id: DataId) -> Result<Option<PendingFlush>> {
@@ -591,11 +620,14 @@ fn merge_samples(
 fn recover_manifest(config: &EngineConfig) -> Result<Manifest> {
     cleanup_stale_tmp_files(&config.data_dir)?;
 
-    let mut manifest = Manifest::load(&config.data_dir, config.max_storage_bytes)?;
+    let mut manifest = Manifest::load(&config.data_dir)?;
     let disk_segments = scan_segments(&config.data_dir)?;
 
     let mut known_files = HashSet::new();
     for entry in manifest.series.values_mut() {
+        if entry.max_storage_bytes.is_none() {
+            entry.max_storage_bytes = config.default_series_max_bytes;
+        }
         entry.segments.retain(|segment| {
             let path = match resolve_segment_path(&config.data_dir, &segment.file) {
                 Ok(path) => path,
@@ -619,6 +651,8 @@ fn recover_manifest(config: &EngineConfig) -> Result<Manifest> {
                     .map(|(_, header, _)| header.series_type)
                     .unwrap_or(SeriesType::I64),
                 next_segment_id: 1,
+                max_storage_bytes: config.default_series_max_bytes,
+                storage_bytes: 0,
                 segments: Vec::new(),
             });
 
@@ -784,7 +818,7 @@ mod tests {
         EngineConfig {
             data_dir: path.to_path_buf(),
             flush_threshold_count: 3,
-            max_storage_bytes: 10_000,
+            default_series_max_bytes: None,
             segment_compression: SegmentCompressionCodec::Zstd,
         }
     }
@@ -838,7 +872,7 @@ mod tests {
     fn append_rejects_old_timestamp_after_flush() {
         let tempdir = TempDir::new().unwrap();
         let engine = Engine::open(test_config(tempdir.path())).unwrap();
-        engine.register_series(1, SeriesType::I64).unwrap();
+        engine.register_series(1, SeriesType::I64, None).unwrap();
         engine
             .append_one(Sample {
                 data_id: 1,
@@ -877,7 +911,7 @@ mod tests {
         let mut config = test_config(tempdir.path());
         config.flush_threshold_count = 2;
         let engine = Engine::open(config).unwrap();
-        engine.register_series(7, SeriesType::Bool).unwrap();
+        engine.register_series(7, SeriesType::Bool, None).unwrap();
         engine
             .append_one(Sample {
                 data_id: 7,
@@ -920,7 +954,7 @@ mod tests {
         let mut config = test_config(tempdir.path());
         config.flush_threshold_count = 2;
         let engine = Engine::open(config).unwrap();
-        engine.register_series(9, SeriesType::I64).unwrap();
+        engine.register_series(9, SeriesType::I64, None).unwrap();
 
         for (timestamp_ms, value) in [(10, 100), (20, 200), (30, 300), (40, 400), (50, 500)] {
             engine
@@ -948,13 +982,13 @@ mod tests {
     }
 
     #[test]
-    fn evicts_oldest_segment_when_limit_is_exceeded() {
+    fn evicts_oldest_segment_when_series_limit_is_exceeded() {
         let tempdir = TempDir::new().unwrap();
         let mut config = test_config(tempdir.path());
         config.flush_threshold_count = 1;
-        config.max_storage_bytes = 80;
+        config.default_series_max_bytes = Some(80);
         let engine = Engine::open(config).unwrap();
-        engine.register_series(1, SeriesType::I64).unwrap();
+        engine.register_series(1, SeriesType::I64, None).unwrap();
 
         engine
             .append_one(Sample {
@@ -974,9 +1008,37 @@ mod tests {
         let manifest = engine.manifest.lock().unwrap().clone();
         assert_eq!(manifest.total_segment_count(), 1);
         assert_eq!(
-            manifest.storage_bytes,
+            manifest.series.get(&1).unwrap().storage_bytes,
             manifest.series.get(&1).unwrap().segments[0].size_bytes
         );
+    }
+
+    #[test]
+    fn series_limit_does_not_evict_other_series() {
+        let tempdir = TempDir::new().unwrap();
+        let mut config = test_config(tempdir.path());
+        config.flush_threshold_count = 1;
+        let engine = Engine::open(config).unwrap();
+        engine
+            .register_series(1, SeriesType::I64, Some(80))
+            .unwrap();
+        engine
+            .register_series(2, SeriesType::I64, Some(10_000))
+            .unwrap();
+
+        for (data_id, timestamp_ms, value) in [(1, 1, 10), (2, 1, 20), (1, 2, 30)] {
+            engine
+                .append_one(Sample {
+                    data_id,
+                    timestamp_ms,
+                    value: Value::I64(value),
+                })
+                .unwrap();
+        }
+
+        let manifest = engine.manifest.lock().unwrap().clone();
+        assert_eq!(manifest.series.get(&1).unwrap().segments.len(), 1);
+        assert_eq!(manifest.series.get(&2).unwrap().segments.len(), 1);
     }
 
     #[test]
@@ -985,7 +1047,7 @@ mod tests {
         let mut config = test_config(tempdir.path());
         config.flush_threshold_count = 2;
         let engine = Engine::open(config).unwrap();
-        engine.register_series(1, SeriesType::I64).unwrap();
+        engine.register_series(1, SeriesType::I64, None).unwrap();
 
         let result = engine.append_batch_detailed(vec![
             Sample {
@@ -1039,13 +1101,14 @@ mod tests {
         let victim_path = tempdir.path().join("victim.txt");
         fs::write(&victim_path, b"TOP_SECRET").unwrap();
 
-        let mut manifest = Manifest::new(10_000);
-        manifest.storage_bytes = 1024;
+        let mut manifest = Manifest::new();
         manifest.series = HashMap::from([(
             1_u64,
             SeriesEntry {
                 series_type: SeriesType::I64,
                 next_segment_id: 2,
+                max_storage_bytes: None,
+                storage_bytes: 1024,
                 segments: vec![SegmentMeta {
                     segment_id: 1,
                     file: "../victim.txt".to_string(),
@@ -1063,6 +1126,6 @@ mod tests {
 
         assert!(victim_path.exists());
         assert_eq!(recovered_manifest.total_segment_count(), 0);
-        assert_eq!(recovered_manifest.storage_bytes, 0);
+        assert_eq!(recovered_manifest.total_storage_bytes(), 0);
     }
 }

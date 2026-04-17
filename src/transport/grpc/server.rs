@@ -143,10 +143,12 @@ impl pb::ingest_service_server::IngestService for TsdbGrpcServer {
         let series_type =
             proto_series_type_to_core(request.series_type).map_err(error_to_status)?;
         let engine = self.engine.clone();
-        task::spawn_blocking(move || engine.register_series(request.data_id, series_type))
-            .await
-            .map_err(join_error_to_status)?
-            .map_err(error_to_status)?;
+        task::spawn_blocking(move || {
+            engine.register_series(request.data_id, series_type, request.max_storage_bytes)
+        })
+        .await
+        .map_err(join_error_to_status)?
+        .map_err(error_to_status)?;
         Ok(Response::new(pb::RegisterSeriesResponse {}))
     }
 
