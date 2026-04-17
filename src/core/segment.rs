@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use crc32fast::Hasher;
@@ -529,8 +529,47 @@ fn decode_payload(path: &Path, header: &SegmentHeader, payload: &[u8]) -> Result
     Ok(body)
 }
 
-pub fn segment_path(data_dir: &Path, meta: &SegmentMeta) -> PathBuf {
-    data_dir.join(&meta.file)
+pub fn segment_path(data_dir: &Path, meta: &SegmentMeta) -> Result<PathBuf> {
+    resolve_segment_path(data_dir, &meta.file)
+}
+
+pub fn resolve_segment_path(data_dir: &Path, rel_path: &str) -> Result<PathBuf> {
+    validate_segment_rel_path(rel_path)?;
+    Ok(data_dir.join(rel_path))
+}
+
+fn validate_segment_rel_path(rel_path: &str) -> Result<()> {
+    let path = Path::new(rel_path);
+    let mut components = path.components();
+
+    match components.next() {
+        Some(Component::Normal(component)) if component == "segments" => {}
+        _ => {
+            return Err(TsdbError::Manifest(format!(
+                "segment path must stay under segments/: {rel_path}"
+            )));
+        }
+    }
+
+    let mut saw_child = false;
+    for component in components {
+        match component {
+            Component::Normal(_) => saw_child = true,
+            _ => {
+                return Err(TsdbError::Manifest(format!(
+                    "segment path contains invalid components: {rel_path}"
+                )));
+            }
+        }
+    }
+
+    if !saw_child {
+        return Err(TsdbError::Manifest(format!(
+            "segment path is incomplete: {rel_path}"
+        )));
+    }
+
+    Ok(())
 }
 
 pub fn record_size(series_type: SeriesType) -> usize {
@@ -628,7 +667,7 @@ mod tests {
             &samples,
         )
         .unwrap();
-        let path = segment_path(tempdir.path(), &meta);
+        let path = segment_path(tempdir.path(), &meta).unwrap();
         let (header, read_back) = read_segment_file(&path).unwrap();
 
         assert_eq!(header.data_id, 7);
@@ -660,7 +699,7 @@ mod tests {
             &samples,
         )
         .unwrap();
-        let path = segment_path(tempdir.path(), &meta);
+        let path = segment_path(tempdir.path(), &meta).unwrap();
         let (header, read_back) = read_segment_file(&path).unwrap();
 
         assert_eq!(header.compression, SegmentCompressionCodec::Zstd);
@@ -698,7 +737,7 @@ mod tests {
             &samples,
         )
         .unwrap();
-        let path = segment_path(tempdir.path(), &meta);
+        let path = segment_path(tempdir.path(), &meta).unwrap();
 
         let range = read_segment_range(&path, 15, 35).unwrap();
         assert_eq!(
@@ -725,7 +764,7 @@ mod tests {
         }];
 
         let meta = write_legacy_v1_segment(tempdir.path(), 9, 2, SeriesType::I64, &samples);
-        let path = segment_path(tempdir.path(), &meta);
+        let path = segment_path(tempdir.path(), &meta).unwrap();
         let (header, read_back) = read_segment_file(&path).unwrap();
 
         assert_eq!(header.version, SEGMENT_VERSION_V1);
@@ -750,7 +789,7 @@ mod tests {
             &samples,
         )
         .unwrap();
-        let path = segment_path(tempdir.path(), &meta);
+        let path = segment_path(tempdir.path(), &meta).unwrap();
         let mut bytes = fs::read(&path).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 0xFF;
@@ -777,7 +816,7 @@ mod tests {
             &samples,
         )
         .unwrap();
-        let path = segment_path(tempdir.path(), &meta);
+        let path = segment_path(tempdir.path(), &meta).unwrap();
         let mut bytes = fs::read(&path).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 0xFF;
@@ -785,6 +824,22 @@ mod tests {
 
         let error = read_segment_file(&path).unwrap_err();
         assert!(matches!(error, TsdbError::CorruptSegment(_)));
+    }
+
+    #[test]
+    fn rejects_segment_paths_outside_segments_root() {
+        let tempdir = TempDir::new().unwrap();
+        let meta = SegmentMeta {
+            segment_id: 1,
+            file: "../victim.txt".to_string(),
+            min_ts_ms: 0,
+            max_ts_ms: 1,
+            count: 1,
+            size_bytes: 1,
+        };
+
+        let error = resolve_segment_path(tempdir.path(), &meta.file).unwrap_err();
+        assert!(matches!(error, TsdbError::Manifest(_)));
     }
 
     fn write_legacy_v1_segment(

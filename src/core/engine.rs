@@ -7,7 +7,8 @@ use crate::config::AppConfig;
 use crate::core::manifest::{Manifest, SegmentMeta, SeriesEntry, manifest_tmp_path};
 use crate::core::segment::{
     DEFAULT_SEGMENT_CACHE_BYTES, SegmentCompressionCodec, SegmentHeader, SegmentReadCache,
-    read_segment_header_only, read_segment_range_with_cache, segment_path, write_segment_file,
+    read_segment_header_only, read_segment_range_with_cache, resolve_segment_path, segment_path,
+    write_segment_file,
 };
 use crate::core::types::{
     BufferedSample, DataId, RangeQuery, RangeSample, Sample, SeriesMeta, SeriesState, SeriesType,
@@ -234,7 +235,7 @@ impl Engine {
         let mut disk_samples = Vec::new();
         let mut segment_cache = self.segment_cache.lock().unwrap();
         for meta in segment_meta {
-            let path = segment_path(&self.config.data_dir, &meta);
+            let path = segment_path(&self.config.data_dir, &meta)?;
             disk_samples.extend(read_segment_range_with_cache(
                 &path,
                 query.start_ts_ms,
@@ -321,7 +322,7 @@ impl Engine {
                 break;
             };
 
-            let path = segment_path(&self.config.data_dir, &victim);
+            let path = segment_path(&self.config.data_dir, &victim)?;
             match fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -556,7 +557,10 @@ fn recover_manifest(config: &EngineConfig) -> Result<Manifest> {
     let mut known_files = HashSet::new();
     for entry in manifest.series.values_mut() {
         entry.segments.retain(|segment| {
-            let path = config.data_dir.join(&segment.file);
+            let path = match resolve_segment_path(&config.data_dir, &segment.file) {
+                Ok(path) => path,
+                Err(_) => return false,
+            };
             let exists = path.exists();
             if exists {
                 known_files.insert(segment.file.clone());
@@ -728,9 +732,12 @@ fn is_dir_empty(path: &Path) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use tempfile::TempDir;
 
     use super::*;
+    use crate::core::manifest::{Manifest, SegmentMeta, SeriesEntry};
     use crate::core::types::Value;
 
     fn test_config(path: &Path) -> EngineConfig {
@@ -951,5 +958,38 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].timestamp_ms, 10);
         assert_eq!(rows[1].timestamp_ms, 12);
+    }
+
+    #[test]
+    fn open_discards_manifest_segments_that_escape_data_dir() {
+        let tempdir = TempDir::new().unwrap();
+        let victim_path = tempdir.path().join("victim.txt");
+        fs::write(&victim_path, b"TOP_SECRET").unwrap();
+
+        let mut manifest = Manifest::new(10_000);
+        manifest.storage_bytes = 1024;
+        manifest.series = HashMap::from([(
+            1_u64,
+            SeriesEntry {
+                series_type: SeriesType::I64,
+                next_segment_id: 2,
+                segments: vec![SegmentMeta {
+                    segment_id: 1,
+                    file: "../victim.txt".to_string(),
+                    min_ts_ms: 0,
+                    max_ts_ms: 1,
+                    count: 1,
+                    size_bytes: 1024,
+                }],
+            },
+        )]);
+        manifest.save(tempdir.path()).unwrap();
+
+        let engine = Engine::open(test_config(tempdir.path())).unwrap();
+        let recovered_manifest = engine.manifest.lock().unwrap().clone();
+
+        assert!(victim_path.exists());
+        assert_eq!(recovered_manifest.total_segment_count(), 0);
+        assert_eq!(recovered_manifest.storage_bytes, 0);
     }
 }
