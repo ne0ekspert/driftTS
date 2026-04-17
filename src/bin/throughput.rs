@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use drift_ts::core::engine::{Engine, EngineConfig};
+use drift_ts::core::segment::SegmentCompressionCodec;
 use drift_ts::core::types::{RangeQuery, Sample, SeriesType, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +22,7 @@ struct ThroughputConfig {
     queries: u64,
     query_span: i64,
     max_storage_bytes: u64,
+    segment_compression: SegmentCompressionCodec,
     data_dir: Option<PathBuf>,
     ingest_mode: IngestMode,
 }
@@ -35,6 +37,7 @@ impl Default for ThroughputConfig {
             queries: 2_000,
             query_span: 2_048,
             max_storage_bytes: 1 << 30,
+            segment_compression: SegmentCompressionCodec::Zstd,
             data_dir: None,
             ingest_mode: IngestMode::AppendOne,
         }
@@ -58,6 +61,10 @@ impl ThroughputConfig {
                 "--query-span" => config.query_span = parse_i64(args.next(), "--query-span")?,
                 "--max-storage-bytes" => {
                     config.max_storage_bytes = parse_u64(args.next(), "--max-storage-bytes")?
+                }
+                "--segment-compression" => {
+                    config.segment_compression =
+                        parse_segment_compression(args.next(), "--segment-compression")?
                 }
                 "--ingest-mode" => {
                     config.ingest_mode = parse_ingest_mode(args.next(), "--ingest-mode")?
@@ -124,6 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         data_dir: data_dir.clone(),
         flush_threshold_count: config.flush_threshold,
         max_storage_bytes: config.max_storage_bytes,
+        segment_compression: config.segment_compression,
     })?;
 
     let register_start = Instant::now();
@@ -164,14 +172,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("driftTS throughput benchmark");
     println!("data_dir: {}", data_dir.display());
     println!(
-        "config: ingest_mode={} samples={} series={} flush_threshold={} batch_size={} queries={} query_span_ms={}",
+        "config: ingest_mode={} samples={} series={} flush_threshold={} batch_size={} queries={} query_span_ms={} segment_compression={}",
         config.ingest_mode.as_str(),
         config.samples,
         config.series,
         config.flush_threshold,
         config.batch_size,
         config.queries,
-        config.query_span
+        config.query_span,
+        config.segment_compression.as_str()
     );
     println!(
         "register: {:?} ({:.0} series/s)",
@@ -240,9 +249,25 @@ fn parse_ingest_mode(value: Option<String>, flag: &str) -> Result<IngestMode, St
     }
 }
 
+fn parse_segment_compression(
+    value: Option<String>,
+    flag: &str,
+) -> Result<SegmentCompressionCodec, String> {
+    match value
+        .ok_or_else(|| format!("missing value after {flag}"))?
+        .as_str()
+    {
+        "none" => Ok(SegmentCompressionCodec::None),
+        "zstd" => Ok(SegmentCompressionCodec::Zstd),
+        other => Err(format!(
+            "invalid value for {flag}: {other}. expected none or zstd"
+        )),
+    }
+}
+
 fn print_usage() {
     eprintln!(
-        "usage: cargo run --release --bin throughput -- [--ingest-mode append-one|append-batch] [--samples N] [--series N] [--flush-threshold N] [--batch-size N] [--queries N] [--query-span N] [--max-storage-bytes N] [--data-dir PATH]"
+        "usage: cargo run --release --bin throughput -- [--ingest-mode append-one|append-batch] [--samples N] [--series N] [--flush-threshold N] [--batch-size N] [--queries N] [--query-span N] [--max-storage-bytes N] [--segment-compression none|zstd] [--data-dir PATH]"
     );
 }
 

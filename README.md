@@ -15,6 +15,7 @@ The crate ships as both:
 - Range queries by `data_id` and timestamp window
 - Manifest-backed recovery on startup
 - CRC32-protected segment files
+- Optional `none|zstd` compression for flushed segment files
 - Configurable flush threshold and storage cap
 - Automatic oldest-segment eviction when the storage budget is exceeded
 - gRPC services generated from [`proto/driftts/v1/driftts.proto`](/home/ne0ekspert/drifTS/proto/driftts/v1/driftts.proto)
@@ -49,6 +50,7 @@ listen_addr = "127.0.0.1:50051"
 data_dir = "data"
 flush_threshold_count = 1000
 max_storage_bytes = 104857600
+segment_compression = "zstd"
 ```
 
 Run the server:
@@ -73,6 +75,7 @@ Config fields:
 - `data_dir`: root directory for `manifest.json` and segment files
 - `flush_threshold_count`: number of buffered samples per series before an automatic flush
 - `max_storage_bytes`: soft storage ceiling for flushed segments
+- `segment_compression`: codec for newly written segment files: `none` or `zstd` (defaults to `zstd` if omitted)
 
 Validation rules:
 
@@ -165,8 +168,8 @@ On disk, the database stores:
 Segment files contain:
 
 - a fixed header with series metadata and min/max timestamps
-- encoded sample records
-- a CRC32 checksum over the segment body
+- encoded sample records, optionally compressed with `zstd`
+- a CRC32 checksum over the uncompressed segment body
 
 Startup recovery:
 
@@ -175,6 +178,7 @@ Startup recovery:
 - rescans segment files on disk
 - restores missing manifest entries for valid segment files
 - drops mismatched segment files if their type conflicts with the registered series
+- supports mixed legacy uncompressed segments and new compressed segments in the same data directory
 
 ## Semantics and Caveats
 
@@ -184,6 +188,7 @@ Startup recovery:
 - Duplicate timestamps inside the in-memory buffer are deduplicated on flush; the last write wins.
 - Query results merge flushed data with buffered data and also keep the last value for duplicate timestamps.
 - `max_storage_bytes` applies to flushed segments only. When exceeded, the engine deletes the globally oldest segment until usage is back under the limit.
+- `storage_bytes` and eviction use the actual on-disk size of segment files, so compressed segments count by their compressed byte size.
 - Buffered, unflushed samples are not persisted across process restarts.
 - `Health()` currently returns a static `ok=true` / `"ok"` response.
 - There is no authentication, TLS, or compaction layer in the current server.
@@ -206,7 +211,8 @@ cargo run --release --bin throughput -- \
   --flush-threshold 4096 \
   --batch-size 1024 \
   --queries 2000 \
-  --query-span 2048
+  --query-span 2048 \
+  --segment-compression zstd
 ```
 
 Supported flags:
@@ -219,6 +225,7 @@ Supported flags:
 - `--queries N`
 - `--query-span N`
 - `--max-storage-bytes N`
+- `--segment-compression none|zstd`
 - `--data-dir PATH`
 
 If `--data-dir` is omitted, the benchmark uses a temporary directory and removes it after completion.

@@ -2,6 +2,7 @@ use tempfile::TempDir;
 use tonic::Request;
 
 use drift_ts::core::engine::{Engine, EngineConfig};
+use drift_ts::core::segment::SegmentCompressionCodec;
 use drift_ts::transport::grpc::pb::{
     self, admin_service_server::AdminService, ingest_service_server::IngestService,
     query_service_server::QueryService,
@@ -15,6 +16,7 @@ async fn grpc_service_round_trip_register_append_query_and_stats() {
         data_dir: tempdir.path().to_path_buf(),
         flush_threshold_count: 2,
         max_storage_bytes: 1_000_000,
+        segment_compression: SegmentCompressionCodec::Zstd,
     })
     .unwrap();
 

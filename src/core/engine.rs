@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use crate::config::AppConfig;
 use crate::core::manifest::{Manifest, SegmentMeta, SeriesEntry, manifest_tmp_path};
 use crate::core::segment::{
-    SegmentHeader, read_segment_header_only, read_segment_range, segment_path, write_segment_file,
+    DEFAULT_SEGMENT_CACHE_BYTES, SegmentCompressionCodec, SegmentHeader, SegmentReadCache,
+    read_segment_header_only, read_segment_range_with_cache, segment_path, write_segment_file,
 };
 use crate::core::types::{
     BufferedSample, DataId, RangeQuery, RangeSample, Sample, SeriesMeta, SeriesState, SeriesType,
@@ -18,6 +19,7 @@ pub struct EngineConfig {
     pub data_dir: PathBuf,
     pub flush_threshold_count: usize,
     pub max_storage_bytes: u64,
+    pub segment_compression: SegmentCompressionCodec,
 }
 
 impl From<&AppConfig> for EngineConfig {
@@ -26,6 +28,7 @@ impl From<&AppConfig> for EngineConfig {
             data_dir: value.data_dir.clone(),
             flush_threshold_count: value.flush_threshold_count,
             max_storage_bytes: value.max_storage_bytes,
+            segment_compression: value.segment_compression,
         }
     }
 }
@@ -63,6 +66,7 @@ pub struct Engine {
     pub config: EngineConfig,
     pub manifest: Arc<Mutex<Manifest>>,
     pub series: Arc<RwLock<HashMap<DataId, Arc<Mutex<SeriesState>>>>>,
+    pub segment_cache: Arc<Mutex<SegmentReadCache>>,
 }
 
 impl Engine {
@@ -75,6 +79,9 @@ impl Engine {
             config,
             manifest: Arc::new(Mutex::new(manifest)),
             series: Arc::new(RwLock::new(series)),
+            segment_cache: Arc::new(Mutex::new(SegmentReadCache::new(
+                DEFAULT_SEGMENT_CACHE_BYTES,
+            ))),
         })
     }
 
@@ -225,14 +232,17 @@ impl Engine {
         };
 
         let mut disk_samples = Vec::new();
+        let mut segment_cache = self.segment_cache.lock().unwrap();
         for meta in segment_meta {
             let path = segment_path(&self.config.data_dir, &meta);
-            disk_samples.extend(read_segment_range(
+            disk_samples.extend(read_segment_range_with_cache(
                 &path,
                 query.start_ts_ms,
                 query.end_ts_ms,
+                Some(&mut segment_cache),
             )?);
         }
+        drop(segment_cache);
 
         let mem_samples = {
             let handle = self.series_handle(query.data_id)?;
@@ -379,6 +389,7 @@ impl Engine {
                 flush.data_id,
                 flush.segment_id,
                 flush.series_type,
+                self.config.segment_compression,
                 &flush.samples,
             )?);
         }
@@ -727,6 +738,7 @@ mod tests {
             data_dir: path.to_path_buf(),
             flush_threshold_count: 3,
             max_storage_bytes: 10_000,
+            segment_compression: SegmentCompressionCodec::Zstd,
         }
     }
 

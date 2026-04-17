@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::core::segment::SegmentCompressionCodec;
 use crate::error::{Result, TsdbError};
 
 pub const DEFAULT_CONFIG_PATH: &str = "drift-ts.toml";
@@ -14,6 +15,8 @@ pub struct AppConfig {
     pub data_dir: PathBuf,
     pub flush_threshold_count: usize,
     pub max_storage_bytes: u64,
+    #[serde(default = "default_segment_compression")]
+    pub segment_compression: SegmentCompressionCodec,
 }
 
 impl AppConfig {
@@ -73,5 +76,57 @@ impl AppConfig {
             ));
         }
         Ok(())
+    }
+}
+
+fn default_segment_compression() -> SegmentCompressionCodec {
+    SegmentCompressionCodec::default()
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn write_config(tempdir: &TempDir, body: &str) -> PathBuf {
+        let path = tempdir.path().join("drift-ts.toml");
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn defaults_segment_compression_to_zstd() {
+        let tempdir = TempDir::new().unwrap();
+        let path = write_config(
+            &tempdir,
+            r#"
+listen_addr = "127.0.0.1:50051"
+data_dir = "data"
+flush_threshold_count = 1000
+max_storage_bytes = 104857600
+"#,
+        );
+
+        let config = AppConfig::load_from_path(path).unwrap();
+        assert_eq!(config.segment_compression, SegmentCompressionCodec::Zstd);
+    }
+
+    #[test]
+    fn parses_explicit_segment_compression() {
+        let tempdir = TempDir::new().unwrap();
+        let path = write_config(
+            &tempdir,
+            r#"
+listen_addr = "127.0.0.1:50051"
+data_dir = "data"
+flush_threshold_count = 1000
+max_storage_bytes = 104857600
+segment_compression = "none"
+"#,
+        );
+
+        let config = AppConfig::load_from_path(path).unwrap();
+        assert_eq!(config.segment_compression, SegmentCompressionCodec::None);
     }
 }
