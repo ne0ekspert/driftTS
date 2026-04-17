@@ -7,8 +7,8 @@ use crate::config::AppConfig;
 use crate::core::manifest::{Manifest, SegmentMeta, SeriesEntry, manifest_tmp_path};
 use crate::core::segment::{
     DEFAULT_SEGMENT_CACHE_BYTES, SegmentCompressionCodec, SegmentHeader, SegmentReadCache,
-    read_segment_header_only, read_segment_range_with_cache, resolve_segment_path, segment_path,
-    write_segment_file,
+    read_segment_header_only, read_segment_range_limited_with_cache, resolve_segment_path,
+    segment_path, write_segment_file,
 };
 use crate::core::types::{
     BufferedSample, DataId, RangeQuery, RangeSample, Sample, SeriesMeta, SeriesState, SeriesType,
@@ -215,6 +215,9 @@ impl Engine {
                 "start_ts_ms must be less than or equal to end_ts_ms".to_string(),
             ));
         }
+        if query.limit == Some(0) {
+            return Ok(Vec::new());
+        }
 
         let segment_meta = {
             let manifest = self.manifest.lock().unwrap();
@@ -233,29 +236,39 @@ impl Engine {
         };
 
         let mut disk_samples = Vec::new();
+        let limit = query.limit.unwrap_or(usize::MAX);
         let mut segment_cache = self.segment_cache.lock().unwrap();
         for meta in segment_meta {
+            let remaining = limit.saturating_sub(disk_samples.len());
+            if remaining == 0 {
+                break;
+            }
             let path = segment_path(&self.config.data_dir, &meta)?;
-            disk_samples.extend(read_segment_range_with_cache(
+            disk_samples.extend(read_segment_range_limited_with_cache(
                 &path,
                 query.start_ts_ms,
                 query.end_ts_ms,
+                remaining,
                 Some(&mut segment_cache),
             )?);
         }
         drop(segment_cache);
 
+        if disk_samples.len() >= limit {
+            disk_samples.truncate(limit);
+            return Ok(disk_samples);
+        }
+
         let mem_samples = {
             let handle = self.series_handle(query.data_id)?;
-            let state = handle.lock().unwrap();
-            let deduped = prepare_flush_samples(state.memtable.clone());
-            deduped
-                .into_iter()
-                .filter(|sample| {
-                    query.start_ts_ms <= sample.timestamp_ms
-                        && sample.timestamp_ms <= query.end_ts_ms
-                })
-                .collect::<Vec<_>>()
+            let mut state = handle.lock().unwrap();
+            refresh_memtable_cache(&mut state);
+            slice_range_samples(
+                &state.memtable_sorted,
+                query.start_ts_ms,
+                query.end_ts_ms,
+                limit.saturating_sub(disk_samples.len()),
+            )
         };
 
         let mut merged = merge_samples(disk_samples, mem_samples);
@@ -433,9 +446,13 @@ impl Engine {
             if state.memtable.is_empty() {
                 return Ok(None);
             }
-            let memtable = std::mem::take(&mut state.memtable);
-            state.mem_max_ts = None;
-            (state.meta.series_type, prepare_flush_samples(memtable))
+            refresh_memtable_cache(&mut state);
+            state.memtable.clear();
+            state.sorted_len = 0;
+            (
+                state.meta.series_type,
+                std::mem::take(&mut state.memtable_sorted),
+            )
         };
 
         if flushed_samples.is_empty() {
@@ -481,9 +498,6 @@ fn append_to_series_state(state: &mut SeriesState, sample: Sample) -> Result<()>
 
     let seq_no = state.next_seq_no;
     state.next_seq_no += 1;
-    state.mem_max_ts = Some(state.mem_max_ts.map_or(sample.timestamp_ms, |current| {
-        current.max(sample.timestamp_ms)
-    }));
     state.memtable.push(BufferedSample { seq_no, sample });
     Ok(())
 }
@@ -519,33 +533,59 @@ pub fn prepare_flush_samples(mut samples: Vec<BufferedSample>) -> Vec<RangeSampl
     deduped
 }
 
+fn refresh_memtable_cache(state: &mut SeriesState) {
+    if state.sorted_len == state.memtable.len() {
+        return;
+    }
+
+    let dirty = prepare_flush_samples(state.memtable[state.sorted_len..].to_vec());
+    if state.sorted_len == 0 {
+        state.memtable_sorted = dirty;
+    } else if !dirty.is_empty() {
+        let existing = std::mem::take(&mut state.memtable_sorted);
+        state.memtable_sorted = merge_samples(existing, dirty);
+    }
+    state.sorted_len = state.memtable.len();
+}
+
+fn slice_range_samples(
+    samples: &[RangeSample],
+    start_ts_ms: i64,
+    end_ts_ms: i64,
+    limit: usize,
+) -> Vec<RangeSample> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let start = samples.partition_point(|sample| sample.timestamp_ms < start_ts_ms);
+    let end = samples
+        .partition_point(|sample| sample.timestamp_ms <= end_ts_ms)
+        .min(start.saturating_add(limit));
+    samples[start..end].to_vec()
+}
+
 fn merge_samples(
     disk_samples: Vec<RangeSample>,
     mem_samples: Vec<RangeSample>,
 ) -> Vec<RangeSample> {
-    let mut combined = Vec::with_capacity(disk_samples.len() + mem_samples.len());
-    let mut order = 0_usize;
-    for sample in disk_samples {
-        combined.push((sample.timestamp_ms, order, sample));
-        order += 1;
-    }
-    for sample in mem_samples {
-        combined.push((sample.timestamp_ms, order, sample));
-        order += 1;
+    let mut disk_iter = disk_samples.into_iter().peekable();
+    let mut mem_iter = mem_samples.into_iter().peekable();
+    let mut merged = Vec::new();
+
+    while let (Some(disk), Some(mem)) = (disk_iter.peek(), mem_iter.peek()) {
+        if disk.timestamp_ms < mem.timestamp_ms {
+            merged.push(disk_iter.next().unwrap());
+        } else if disk.timestamp_ms > mem.timestamp_ms {
+            merged.push(mem_iter.next().unwrap());
+        } else {
+            disk_iter.next();
+            merged.push(mem_iter.next().unwrap());
+        }
     }
 
-    combined.sort_by_key(|(timestamp, order, _)| (*timestamp, *order));
-    let mut deduped: Vec<RangeSample> = Vec::with_capacity(combined.len());
-    for (_, _, sample) in combined {
-        if let Some(last) = deduped.last_mut() {
-            if last.timestamp_ms == sample.timestamp_ms {
-                *last = sample;
-                continue;
-            }
-        }
-        deduped.push(sample);
-    }
-    deduped
+    merged.extend(disk_iter);
+    merged.extend(mem_iter);
+    merged
 }
 
 fn recover_manifest(config: &EngineConfig) -> Result<Manifest> {
@@ -871,6 +911,39 @@ mod tests {
 
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].timestamp_ms, 10);
+        assert_eq!(result[2].timestamp_ms, 30);
+    }
+
+    #[test]
+    fn query_limit_returns_earliest_rows_in_range() {
+        let tempdir = TempDir::new().unwrap();
+        let mut config = test_config(tempdir.path());
+        config.flush_threshold_count = 2;
+        let engine = Engine::open(config).unwrap();
+        engine.register_series(9, SeriesType::I64).unwrap();
+
+        for (timestamp_ms, value) in [(10, 100), (20, 200), (30, 300), (40, 400), (50, 500)] {
+            engine
+                .append_one(Sample {
+                    data_id: 9,
+                    timestamp_ms,
+                    value: Value::I64(value),
+                })
+                .unwrap();
+        }
+
+        let result = engine
+            .query_range(RangeQuery {
+                data_id: 9,
+                start_ts_ms: 0,
+                end_ts_ms: 100,
+                limit: Some(3),
+            })
+            .unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].timestamp_ms, 10);
+        assert_eq!(result[1].timestamp_ms, 20);
         assert_eq!(result[2].timestamp_ms, 30);
     }
 

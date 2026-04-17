@@ -21,6 +21,7 @@ struct ThroughputConfig {
     batch_size: usize,
     queries: u64,
     query_span: i64,
+    query_limit: Option<usize>,
     max_storage_bytes: u64,
     segment_compression: SegmentCompressionCodec,
     data_dir: Option<PathBuf>,
@@ -36,6 +37,7 @@ impl Default for ThroughputConfig {
             batch_size: 1_024,
             queries: 2_000,
             query_span: 2_048,
+            query_limit: None,
             max_storage_bytes: 1 << 30,
             segment_compression: SegmentCompressionCodec::Zstd,
             data_dir: None,
@@ -59,6 +61,9 @@ impl ThroughputConfig {
                 "--batch-size" => config.batch_size = parse_usize(args.next(), "--batch-size")?,
                 "--queries" => config.queries = parse_u64(args.next(), "--queries")?,
                 "--query-span" => config.query_span = parse_i64(args.next(), "--query-span")?,
+                "--query-limit" => {
+                    config.query_limit = Some(parse_usize(args.next(), "--query-limit")?)
+                }
                 "--max-storage-bytes" => {
                     config.max_storage_bytes = parse_u64(args.next(), "--max-storage-bytes")?
                 }
@@ -102,6 +107,9 @@ impl ThroughputConfig {
         }
         if config.query_span <= 0 {
             return Err("--query-span must be greater than zero".to_string());
+        }
+        if config.query_limit == Some(0) {
+            return Err("--query-limit must be greater than zero".to_string());
         }
 
         Ok(config)
@@ -161,7 +169,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             data_id,
             start_ts_ms: start_ts,
             end_ts_ms: end_ts,
-            limit: None,
+            limit: config.query_limit,
         })?;
         total_rows_returned += rows.len();
     }
@@ -172,7 +180,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("driftTS throughput benchmark");
     println!("data_dir: {}", data_dir.display());
     println!(
-        "config: ingest_mode={} samples={} series={} flush_threshold={} batch_size={} queries={} query_span_ms={} segment_compression={}",
+        "config: ingest_mode={} samples={} series={} flush_threshold={} batch_size={} queries={} query_span_ms={} query_limit={} segment_compression={}",
         config.ingest_mode.as_str(),
         config.samples,
         config.series,
@@ -180,6 +188,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.batch_size,
         config.queries,
         config.query_span,
+        config
+            .query_limit
+            .map_or_else(|| "none".to_string(), |value| value.to_string()),
         config.segment_compression.as_str()
     );
     println!(
@@ -267,7 +278,7 @@ fn parse_segment_compression(
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo run --release --bin throughput -- [--ingest-mode append-one|append-batch] [--samples N] [--series N] [--flush-threshold N] [--batch-size N] [--queries N] [--query-span N] [--max-storage-bytes N] [--segment-compression none|zstd] [--data-dir PATH]"
+        "usage: cargo run --release --bin throughput -- [--ingest-mode append-one|append-batch] [--samples N] [--series N] [--flush-threshold N] [--batch-size N] [--queries N] [--query-span N] [--query-limit N] [--max-storage-bytes N] [--segment-compression none|zstd] [--data-dir PATH]"
     );
 }
 

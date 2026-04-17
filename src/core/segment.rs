@@ -82,12 +82,14 @@ impl SegmentReadCache {
     }
 
     pub fn get(&mut self, path: &Path) -> Option<(SegmentHeader, Arc<Vec<u8>>)> {
-        let cached = self.entries.get(path)?.clone();
+        let cached = self.entries.get(path)?;
+        let header = cached.header.clone();
+        let body = Arc::clone(&cached.body);
         self.touch(path);
-        Some((cached.header, cached.body))
+        Some((header, body))
     }
 
-    pub fn insert(&mut self, path: PathBuf, header: SegmentHeader, body: Vec<u8>) {
+    pub fn insert(&mut self, path: PathBuf, header: SegmentHeader, body: Arc<Vec<u8>>) {
         if self.max_bytes == 0 {
             return;
         }
@@ -107,7 +109,7 @@ impl SegmentReadCache {
             path.clone(),
             CachedSegment {
                 header,
-                body: Arc::new(body),
+                body,
                 size_bytes,
             },
         );
@@ -226,18 +228,47 @@ pub fn read_segment_range(path: &Path, start_ts: i64, end_ts: i64) -> Result<Vec
     read_segment_range_with_cache(path, start_ts, end_ts, None)
 }
 
+pub fn read_segment_range_limited(
+    path: &Path,
+    start_ts: i64,
+    end_ts: i64,
+    limit: usize,
+) -> Result<Vec<RangeSample>> {
+    read_segment_range_limited_with_cache(path, start_ts, end_ts, limit, None)
+}
+
 pub fn read_segment_range_with_cache(
     path: &Path,
     start_ts: i64,
     end_ts: i64,
+    cache: Option<&mut SegmentReadCache>,
+) -> Result<Vec<RangeSample>> {
+    read_segment_range_limited_with_cache(path, start_ts, end_ts, usize::MAX, cache)
+}
+
+pub fn read_segment_range_limited_with_cache(
+    path: &Path,
+    start_ts: i64,
+    end_ts: i64,
+    limit: usize,
     mut cache: Option<&mut SegmentReadCache>,
 ) -> Result<Vec<RangeSample>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
     if let Some(cache) = cache.as_deref_mut() {
         if let Some((header, body)) = cache.get(path) {
             if header.max_ts_ms < start_ts || header.min_ts_ms > end_ts {
                 return Ok(Vec::new());
             }
-            return decode_body_range(header.series_type, body.as_slice(), start_ts, end_ts);
+            return decode_body_range_limited(
+                header.series_type,
+                body.as_slice(),
+                start_ts,
+                end_ts,
+                limit,
+            );
         }
     }
 
@@ -259,10 +290,18 @@ pub fn read_segment_range_with_cache(
     validate_crc(path, &header, &body)?;
     if header.compression != SegmentCompressionCodec::None {
         if let Some(cache) = cache.as_deref_mut() {
-            cache.insert(path.to_path_buf(), header.clone(), body.clone());
+            let body = Arc::new(body);
+            cache.insert(path.to_path_buf(), header.clone(), Arc::clone(&body));
+            return decode_body_range_limited(
+                header.series_type,
+                body.as_slice(),
+                start_ts,
+                end_ts,
+                limit,
+            );
         }
     }
-    decode_body_range(header.series_type, &body, start_ts, end_ts)
+    decode_body_range_limited(header.series_type, &body, start_ts, end_ts, limit)
 }
 
 pub fn parse_segment_header(buf: &[u8]) -> Result<SegmentHeader> {
@@ -414,12 +453,17 @@ fn decode_body(series_type: SeriesType, body: &[u8]) -> Result<Vec<RangeSample>>
     Ok(result)
 }
 
-fn decode_body_range(
+fn decode_body_range_limited(
     series_type: SeriesType,
     body: &[u8],
     start_ts: i64,
     end_ts: i64,
+    limit: usize,
 ) -> Result<Vec<RangeSample>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
     let record_size = record_size(series_type);
     let count = body.len() / record_size;
     if count == 0 {
@@ -432,6 +476,7 @@ fn decode_body_range(
         return Ok(Vec::new());
     }
 
+    let end_idx = end_idx.min(start_idx.saturating_add(limit));
     let mut result = Vec::with_capacity(end_idx - start_idx);
     for idx in start_idx..end_idx {
         result.push(decode_sample_at(series_type, body, idx * record_size)?);
@@ -532,7 +577,10 @@ fn decode_payload(path: &Path, header: &SegmentHeader, payload: &[u8]) -> Result
             let mut limited = decoder.take(header.uncompressed_size_bytes + 1);
             let mut body = Vec::new();
             limited.read_to_end(&mut body).map_err(|error| {
-                TsdbError::CorruptSegment(format!("failed to decompress {}: {error}", path.display()))
+                TsdbError::CorruptSegment(format!(
+                    "failed to decompress {}: {error}",
+                    path.display()
+                ))
             })?;
             if body.len() as u64 > header.uncompressed_size_bytes {
                 return Err(TsdbError::CorruptSegment(format!(
@@ -768,6 +816,55 @@ mod tests {
         let path = segment_path(tempdir.path(), &meta).unwrap();
 
         let range = read_segment_range(&path, 15, 35).unwrap();
+        assert_eq!(
+            range,
+            vec![
+                RangeSample {
+                    timestamp_ms: 20,
+                    value: Value::I64(200),
+                },
+                RangeSample {
+                    timestamp_ms: 30,
+                    value: Value::I64(300),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reads_only_requested_limit_from_segment() {
+        let tempdir = TempDir::new().unwrap();
+        let samples = vec![
+            RangeSample {
+                timestamp_ms: 10,
+                value: Value::I64(100),
+            },
+            RangeSample {
+                timestamp_ms: 20,
+                value: Value::I64(200),
+            },
+            RangeSample {
+                timestamp_ms: 30,
+                value: Value::I64(300),
+            },
+            RangeSample {
+                timestamp_ms: 40,
+                value: Value::I64(400),
+            },
+        ];
+
+        let meta = write_segment_file(
+            tempdir.path(),
+            12,
+            5,
+            SeriesType::I64,
+            SegmentCompressionCodec::Zstd,
+            &samples,
+        )
+        .unwrap();
+        let path = segment_path(tempdir.path(), &meta).unwrap();
+
+        let range = read_segment_range_limited(&path, 15, 45, 2).unwrap();
         assert_eq!(
             range,
             vec![

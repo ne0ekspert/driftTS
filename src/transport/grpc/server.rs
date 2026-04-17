@@ -3,6 +3,7 @@ use std::fs;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 
+use tokio::task;
 #[cfg(unix)]
 use tokio_stream::wrappers::TcpListenerStream;
 #[cfg(not(unix))]
@@ -30,6 +31,10 @@ impl TsdbGrpcServer {
     pub fn new(engine: Engine) -> Self {
         Self { engine }
     }
+}
+
+fn join_error_to_status(error: task::JoinError) -> Status {
+    Status::internal(format!("blocking task failed: {error}"))
 }
 
 pub async fn serve(endpoint: &ListenEndpoint, grpc: TsdbGrpcServer) -> TsdbResult<()> {
@@ -137,8 +142,10 @@ impl pb::ingest_service_server::IngestService for TsdbGrpcServer {
         let request = request.into_inner();
         let series_type =
             proto_series_type_to_core(request.series_type).map_err(error_to_status)?;
-        self.engine
-            .register_series(request.data_id, series_type)
+        let engine = self.engine.clone();
+        task::spawn_blocking(move || engine.register_series(request.data_id, series_type))
+            .await
+            .map_err(join_error_to_status)?
             .map_err(error_to_status)?;
         Ok(Response::new(pb::RegisterSeriesResponse {}))
     }
@@ -152,9 +159,11 @@ impl pb::ingest_service_server::IngestService for TsdbGrpcServer {
         for sample in request.samples {
             samples.push(proto_sample_to_core(sample).map_err(error_to_status)?);
         }
-        Ok(Response::new(append_response(
-            self.engine.append_batch_detailed(samples),
-        )))
+        let engine = self.engine.clone();
+        let detail = task::spawn_blocking(move || engine.append_batch_detailed(samples))
+            .await
+            .map_err(join_error_to_status)?;
+        Ok(Response::new(append_response(detail)))
     }
 
     async fn flush_series(
@@ -162,9 +171,10 @@ impl pb::ingest_service_server::IngestService for TsdbGrpcServer {
         request: Request<pb::FlushSeriesRequest>,
     ) -> Result<Response<pb::FlushSeriesResponse>, Status> {
         let request = request.into_inner();
-        let flushed = self
-            .engine
-            .flush_series(request.data_id)
+        let engine = self.engine.clone();
+        let flushed = task::spawn_blocking(move || engine.flush_series(request.data_id))
+            .await
+            .map_err(join_error_to_status)?
             .map_err(error_to_status)?;
         Ok(Response::new(pb::FlushSeriesResponse { flushed }))
     }
@@ -173,7 +183,11 @@ impl pb::ingest_service_server::IngestService for TsdbGrpcServer {
         &self,
         _request: Request<pb::FlushAllRequest>,
     ) -> Result<Response<pb::FlushAllResponse>, Status> {
-        let flushed_series = self.engine.flush_all().map_err(error_to_status)?;
+        let engine = self.engine.clone();
+        let flushed_series = task::spawn_blocking(move || engine.flush_all())
+            .await
+            .map_err(join_error_to_status)?
+            .map_err(error_to_status)?;
         Ok(Response::new(pb::FlushAllResponse { flushed_series }))
     }
 }
@@ -185,9 +199,10 @@ impl pb::query_service_server::QueryService for TsdbGrpcServer {
         request: Request<pb::RangeQueryRequest>,
     ) -> Result<Response<pb::RangeQueryResponse>, Status> {
         let query = proto_query_to_core(request.into_inner()).map_err(error_to_status)?;
-        let samples = self
-            .engine
-            .query_range(query)
+        let engine = self.engine.clone();
+        let samples = task::spawn_blocking(move || engine.query_range(query))
+            .await
+            .map_err(join_error_to_status)?
             .map_err(error_to_status)?
             .into_iter()
             .map(core_range_sample_to_proto)
@@ -203,13 +218,21 @@ impl pb::admin_service_server::AdminService for TsdbGrpcServer {
         &self,
         _request: Request<pb::StatsRequest>,
     ) -> Result<Response<pb::StatsResponse>, Status> {
-        Ok(Response::new(stats_response(self.engine.stats())))
+        let engine = self.engine.clone();
+        let stats = task::spawn_blocking(move || engine.stats())
+            .await
+            .map_err(join_error_to_status)?;
+        Ok(Response::new(stats_response(stats)))
     }
 
     async fn health(
         &self,
         _request: Request<pb::HealthRequest>,
     ) -> Result<Response<pb::HealthResponse>, Status> {
-        Ok(Response::new(health_response(self.engine.health())))
+        let engine = self.engine.clone();
+        let health = task::spawn_blocking(move || engine.health())
+            .await
+            .map_err(join_error_to_status)?;
+        Ok(Response::new(health_response(health)))
     }
 }

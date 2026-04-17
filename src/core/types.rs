@@ -64,7 +64,8 @@ pub struct BufferedSample {
 pub struct SeriesState {
     pub meta: SeriesMeta,
     pub memtable: Vec<BufferedSample>,
-    pub mem_max_ts: Option<i64>,
+    pub memtable_sorted: Vec<RangeSample>,
+    pub sorted_len: usize,
     pub flushed_max_ts: Option<i64>,
     pub next_seq_no: u64,
 }
@@ -74,7 +75,8 @@ impl SeriesState {
         Self {
             meta,
             memtable: Vec::new(),
-            mem_max_ts: None,
+            memtable_sorted: Vec::new(),
+            sorted_len: 0,
             flushed_max_ts,
             next_seq_no: 0,
         }

@@ -61,7 +61,7 @@ impl Manifest {
         fs::create_dir_all(data_dir)?;
         let path = manifest_path(data_dir);
         let tmp = manifest_tmp_path(data_dir);
-        let payload = serde_json::to_vec_pretty(self)?;
+        let payload = serde_json::to_vec(self)?;
         fs::write(&tmp, payload)?;
         File::open(&tmp)?.sync_all()?;
         fs::rename(&tmp, &path)?;
