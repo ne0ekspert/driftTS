@@ -101,7 +101,11 @@ impl Engine {
         if manifest.series.contains_key(&data_id) {
             return Err(TsdbError::SeriesExists(data_id));
         }
-        let max_storage_bytes = max_storage_bytes.or(self.config.default_series_max_bytes);
+        let max_storage_bytes = match (self.config.default_series_max_bytes, max_storage_bytes) {
+            (Some(default_max), Some(requested_max)) => Some(requested_max.min(default_max)),
+            (Some(default_max), None) => Some(default_max),
+            (None, requested_max) => requested_max,
+        };
         if max_storage_bytes == Some(0) {
             return Err(TsdbError::Config(
                 "max_storage_bytes must be greater than zero when set".to_string(),
@@ -1011,6 +1015,21 @@ mod tests {
             manifest.series.get(&1).unwrap().storage_bytes,
             manifest.series.get(&1).unwrap().segments[0].size_bytes
         );
+    }
+
+    #[test]
+    fn register_series_clamps_client_limit_to_default_cap() {
+        let tempdir = TempDir::new().unwrap();
+        let mut config = test_config(tempdir.path());
+        config.default_series_max_bytes = Some(80);
+        let engine = Engine::open(config).unwrap();
+
+        engine
+            .register_series(1, SeriesType::I64, Some(10_000))
+            .unwrap();
+
+        let manifest = engine.manifest.lock().unwrap().clone();
+        assert_eq!(manifest.series.get(&1).unwrap().max_storage_bytes, Some(80));
     }
 
     #[test]
